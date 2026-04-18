@@ -2,3 +2,4 @@
 Cargo.lock
 .bare-test.toml
 .spec-workflow
+.vscode
