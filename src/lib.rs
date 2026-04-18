@@ -545,12 +545,8 @@ impl RknpuIrqHandler {
 }
 
 impl DriverGeneric for Rknpu {
-    fn open(&mut self) -> Result<(), rdif_base::KError> {
-        Self::open(self).map_err(|_| rdif_base::KError::Unknown("open fail"))
-    }
-
-    fn close(&mut self) -> Result<(), rdif_base::KError> {
-        Ok(())
+    fn name(&self) -> &str {
+        "rknpu"
     }
 }
 
