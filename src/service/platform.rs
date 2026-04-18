@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use crate::{Rknpu, RknpuError};
 
 use super::error::RknpuServiceError;
@@ -86,6 +88,6 @@ pub trait RknpuSchedulerRuntime: Send + Sync + 'static {
 }
 
 /// Convenience bound used by [`crate::service::RknpuService`].
-pub trait RknpuRuntime: RknpuDeviceAccess + RknpuUserMemory + RknpuSchedulerRuntime {}
+pub trait RknpuPlatform: RknpuDeviceAccess + RknpuUserMemory + RknpuSchedulerRuntime {}
 
-impl<T> RknpuRuntime for T where T: RknpuDeviceAccess + RknpuUserMemory + RknpuSchedulerRuntime {}
+impl<T> RknpuPlatform for T where T: RknpuDeviceAccess + RknpuUserMemory + RknpuSchedulerRuntime {}

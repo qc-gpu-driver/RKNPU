@@ -34,6 +34,8 @@ pub use status::*;
 pub use task::*;
 pub mod ioctrl;
 use crate::data::RknpuData;
+#[cfg(feature = "starryos")]
+pub use crate::power::*;
 use crate::registers::RknpuCore;
 
 const VERSION_MAJOR: u32 = 0;
@@ -120,6 +122,18 @@ impl core::convert::TryFrom<u32> for RknpuAction {
 /// It owns the MMIO windows for all visible cores, the chip-specific capability
 /// data, and the GEM pool shared with userspace. Submission, action, and memory
 /// management all flow through this type.
+///
+/// # Completion waiting
+///
+/// By default the driver remains backward-compatible and busy-polls
+/// `INTERRUPT_STATUS` after a submit. Calling [`set_wait_fn`] switches the
+/// driver to an interrupt-assisted wait path:
+///
+/// ```text
+///  default (no wait_fn): submit -> loop { read MMIO } -> done
+///  with wait_fn:         submit -> loop { check atomic; sleep } -> IRQ
+///                        arrives -> handler stores status -> CPU wakes -> done
+/// ```
 pub struct Rknpu {
     /// Register-access wrapper per visible core.
     base: Vec<RknpuCore>,
@@ -130,8 +144,19 @@ pub struct Rknpu {
     data: RknpuData,
     /// Whether an IOMMU sits between the NPU and system memory.
     iommu_enabled: bool,
+    /// Current logical IOMMU domain id exposed through the action ioctl.
+    ///
+    /// StarryOS does not yet wire this to a real domain-switching backend, but
+    /// keeping the state here preserves the userspace-visible contract and
+    /// mirrors the Linux driver shape.
+    iommu_domain_id: i32,
     /// DMA buffer pool shared with userspace (see [`gem`] module).
     pub(crate) gem: GemPool,
+    /// Optional platform-provided wait function used for interrupt-driven mode.
+    ///
+    /// `None` keeps the legacy polling path. `Some(f)` lets the driver sleep
+    /// between atomic checks and resume when an IRQ wakes the CPU.
+    wait_fn: Option<fn()>,
 }
 
 impl Rknpu {
@@ -154,12 +179,36 @@ impl Rknpu {
             data,
             config,
             iommu_enabled: false,
+            iommu_domain_id: 0,
             gem: GemPool::new(),
+            wait_fn: None,
         }
     }
 
     pub fn open(&mut self) -> Result<(), RknpuError> {
         Ok(())
+    }
+
+    /// Enable interrupt-driven waiting by installing a platform sleep function.
+    ///
+    /// After this call the submit path stops busy-polling MMIO directly and
+    /// instead checks the shared `irq_status` atomic between calls to `f()`.
+    ///
+    /// Typical AArch64 usage:
+    ///
+    /// ```ignore
+    /// // After registering the NPU IRQ handler:
+    /// npu.set_wait_fn(axcpu::wait_for_irqs);
+    /// ```
+    ///
+    /// Safety notes:
+    ///
+    /// The provided function must return when any interrupt arrives, including
+    /// the NPU IRQ. The platform must also register the NPU IRQ before relying
+    /// on this mode.
+    pub fn set_wait_fn(&mut self, f: fn()) {
+        warn!("[NPU] Interrupt-driven mode enabled (WFI)");
+        self.wait_fn = Some(f);
     }
 
     #[allow(dead_code)]
@@ -387,8 +436,12 @@ impl Rknpu {
             RknpuAction::GetTotalRwAmount => self.get_total_rw_amount(),
             RknpuAction::GetIommuEn => Ok(if self.iommu_enabled { 1 } else { 0 }),
             RknpuAction::SetProcNice => {
-                let _ = value;
-                Err(RknpuError::NotSupported)
+                let nice = i32::from_ne_bytes(value.to_ne_bytes());
+                warn!(
+                    "SetProcNice({}) is not applicable in the bare-metal driver context",
+                    nice
+                );
+                Ok(0)
             }
             RknpuAction::PowerOn => {
                 warn!("PowerOn requires platform PM integration");
@@ -400,8 +453,15 @@ impl Rknpu {
             }
             RknpuAction::GetTotalSramSize => Ok(self.data.nbuf_size as u32),
             RknpuAction::GetFreeSramSize => Ok(self.data.nbuf_size as u32),
-            RknpuAction::GetIommuDomainId => Err(RknpuError::NotSupported),
-            RknpuAction::SetIommuDomainId => Err(RknpuError::NotSupported),
+            RknpuAction::GetIommuDomainId => Ok(self.iommu_domain_id as u32),
+            RknpuAction::SetIommuDomainId => {
+                let domain_id = i32::from_ne_bytes(value.to_ne_bytes());
+                if !(0..16).contains(&domain_id) {
+                    return Err(RknpuError::InvalidParameter);
+                }
+                self.iommu_domain_id = domain_id;
+                Ok(0)
+            }
         }
     }
 
@@ -420,7 +480,7 @@ impl Rknpu {
     /// Unlike the ioctl path, which steps one task at a time, this accepts a
     /// [`Submit`] object built by the `task/` module.
     pub fn submit(&mut self, job: &mut Submit) -> Result<(), RknpuError> {
-        self.base[0].submit(&self.data, job)
+        self.base[0].submit(&self.data, self.wait_fn, job)
     }
 
     /// Harvests every per-core completion currently published by IRQ handlers.
@@ -511,7 +571,6 @@ impl DerefMut for Rknpu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{vec, vec::Vec};
 
     fn build_test_npu(core_count: usize) -> Rknpu {
         let mut mmios = (0..core_count)
@@ -559,14 +618,21 @@ mod tests {
     }
 
     #[test]
-    fn action_legacy_management_variants_return_not_supported() {
+    fn action_iommu_domain_round_trip_uses_input_value() {
         let mut npu = build_test_npu(1);
-        assert_eq!(
-            npu.action(RknpuAction::SetProcNice, 10).unwrap_err(),
-            RknpuError::NotSupported
-        );
-        assert_eq!(npu.action(RknpuAction::GetIommuDomainId, 0).unwrap_err(), RknpuError::NotSupported);
-        assert_eq!(npu.action(RknpuAction::SetIommuDomainId, 7).unwrap_err(), RknpuError::NotSupported);
+
+        assert_eq!(npu.action(RknpuAction::GetIommuDomainId, 0).unwrap(), 0);
+        assert_eq!(npu.action(RknpuAction::SetIommuDomainId, 7).unwrap(), 0);
+        assert_eq!(npu.action(RknpuAction::GetIommuDomainId, 0).unwrap(), 7);
+    }
+
+    #[test]
+    fn action_rejects_out_of_range_iommu_domain() {
+        let mut npu = build_test_npu(1);
+
+        let err = npu.action(RknpuAction::SetIommuDomainId, 16).unwrap_err();
+
+        assert_eq!(err, RknpuError::InvalidParameter);
     }
 
     #[test]

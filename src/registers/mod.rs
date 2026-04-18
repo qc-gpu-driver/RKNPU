@@ -21,7 +21,7 @@ const RKNPU_PC_DATA_EXTRA_AMOUNT: u32 = 4;
 const PC_BASE_ADDRESS_OFFSET: u16 = 0x0010;
 const PC_INTERRUPT_MASK_OFFSET: u16 = 0x0020;
 const PC_TASK_CON_OFFSET: u16 = 0x0030;
-const PC_TASK_DMA_BASE_ADDR_OFFSET: u16 = 0x0034;
+const PC_task_array_dma_address_ADDR_OFFSET: u16 = 0x0034;
 const PC_INTERRUPT_STATUS_OFFSET: u16 = 0x0028;
 const PC_INTERRUPT_RAW_STATUS_OFFSET: u16 = 0x002c;
 const PC_TASK_STATUS_OFFSET: u16 = 0x003c;
@@ -68,7 +68,7 @@ impl RknpuCore {
         let job = SubmitRef {
             base: SubmitBase {
                 flags: JobMode::from_bits_retain(submit_flags),
-                task_array_dma_addr: task_dma_addr as _,
+                task_array_dma_address: task_dma_addr as _,
                 core_idx: idx,
                 // Wait for the LAST task's interrupt (pipeline completion)
                 int_mask: rknpu_task.int_mask,
@@ -79,7 +79,7 @@ impl RknpuCore {
             regcmd_base_addr: rknpu_task.regcmd_addr as _,
         };
         debug!(
-            "[NPU] core{} start_execute_one task_dma_base={:#x} regcmd_base={:#x} regcfg_amount={} int_mask={:#x} flags={:#x}",
+            "[NPU] core{} start_execute_one task_array_dma_address={:#x} regcmd_base={:#x} regcfg_amount={} int_mask={:#x} flags={:#x}",
             idx,
             task_dma_addr,
             job.regcmd_base_addr,
@@ -111,16 +111,29 @@ impl RknpuCore {
     ///
     /// `idx` is both the `subcore_task[]` index and the physical core index.
     ///
-    /// Waits for the IRQ handler to publish completion status via the `irq_status`
-    /// atomic. The hardware accepts at most `max_submit_number` tasks per batch;
-    /// larger submits are split and waited on in turn.
+    /// # Completion modes
+    ///
+    /// - **IRQ-driven** (`wait_fn = Some`)`: the CPU sleeps between checks. When
+    ///   the NPU finishes, the IRQ handler calls `handle_interrupt()`, stores
+    ///   the fuzzed status into `irq_status`, and the loop exits on the next
+    ///   wake-up.
+    ///
+    /// - **Busy-polling** (`wait_fn = None`): the CPU reads
+    ///   `INTERRUPT_STATUS` directly in a tight loop. Simple, but wasteful.
+    ///
+    /// # Batching
+    ///
+    /// The hardware accepts at most `max_submit_number` tasks per batch. If the
+    /// submit range is larger, this function loops and waits for each batch in
+    /// turn.
     pub fn _submit_one(
         &mut self,
         data: &RknpuData,
+        wait_fn: Option<fn()>,
         idx: usize,
         args: &mut RknpuSubmit,
     ) -> Result<usize, RknpuError> {
-        let task_ptr = args.task_array_cpu_addr as *mut RknpuTask;
+        let task_ptr = args.task_array_cpu_address as *mut RknpuTask;
         let subcore = &args.subcore_task[idx];
 
         let mut task_iter = subcore.task_start as usize;
@@ -137,7 +150,7 @@ impl RknpuCore {
             let job = SubmitRef {
                 base: SubmitBase {
                     flags: JobMode::from_bits_retain(args.flags),
-                    task_array_dma_addr: args.task_array_dma_addr as _,
+                    task_array_dma_address: args.task_array_dma_address as _,
                     core_idx: idx,
                     // Wait for the LAST task's interrupt (pipeline completion)
                     int_mask: submit_tasks.last().unwrap().int_mask,
@@ -167,14 +180,45 @@ impl RknpuCore {
             self.submit_pc(data, &job).unwrap();
 
             // ── Wait for completion ──────────────────────────────────────
-            let int_status = loop {
-                let status = self.irq_status.load(Ordering::Acquire);
-                if status & job.base.int_mask > 0 {
-                    break job.base.int_mask & status;
+            let int_status = if let Some(wait) = wait_fn {
+                debug!("[NPU]   waiting (IRQ+WFI mode)...");
+                // ┌─────────────────────────────────────────────────────┐
+                // │  IRQ-driven mode (CPU sleeps between checks)        │
+                // │                                                     │
+                // │  NPU runs → fires IRQ → handler calls               │
+                // │  handle_interrupt() → stores fuzzed status to       │
+                // │  irq_status atomic → CPU wakes from WFI → we       │
+                // │  read the atomic here and proceed.                  │
+                // └─────────────────────────────────────────────────────┘
+                loop {
+                    let status = self.irq_status.load(Ordering::Acquire);
+                    if status & job.base.int_mask > 0 {
+                        break job.base.int_mask & status;
+                    }
+                    if status != 0 {
+                        debug!("Unexpected IRQ status: {:#x}", status);
+                        return Err(RknpuError::TaskError);
+                    }
+                    // Sleep until any interrupt (including NPU) wakes the CPU.
+                    (wait)();
                 }
-                if status != 0 {
-                    debug!("Unexpected IRQ status: {:#x}", status);
-                    return Err(RknpuError::TaskError);
+            } else {
+                // ┌─────────────────────────────────────────────────────┐
+                // │  Legacy busy-poll mode (direct MMIO register read)  │
+                // │                                                     │
+                // │  CPU spins reading INTERRUPT_STATUS until the       │
+                // │  expected bits appear.  Simple but wastes cycles.   │
+                // └─────────────────────────────────────────────────────┘
+                loop {
+                    let status = self.pc().interrupt_status().read().bits();
+                    let status = rknpu_fuzz_status(status);
+                    if status & job.base.int_mask > 0 {
+                        break job.base.int_mask & status;
+                    }
+                    if status != 0 {
+                        debug!("Interrupt status changed: {:#x}", status);
+                        return Err(RknpuError::TaskError);
+                    }
                 }
             };
 
@@ -330,12 +374,12 @@ impl RknpuCore {
             .task_con()
             .write(|w| unsafe { w.bits(task_control) });
         debug!(
-            "Set PC TASK_DMA_BASE_ADDR to {:#x}",
-            args.base.task_array_dma_addr
+            "Set PC task_array_dma_address_ADDR to {:#x}",
+            args.base.task_array_dma_address
         );
         self.pc()
             .task_dma_base_addr()
-            .write(|w| unsafe { w.bits(args.base.task_array_dma_addr) });
+            .write(|w| unsafe { w.bits(args.base.task_array_dma_address) });
         mb();
         self.pc().operation_enable().write(|w| unsafe { w.bits(1) });
         mb();
@@ -349,6 +393,7 @@ impl RknpuCore {
     pub fn submit(
         &mut self,
         config: &RknpuData,
+        wait_fn: Option<fn()>,
         args: &mut Submit,
     ) -> Result<(), RknpuError> {
         let max_submit_number = config.max_submit_number as usize;
@@ -377,14 +422,29 @@ impl RknpuCore {
             self.irq_status.store(0, Ordering::Release);
             self.submit_pc(config, &job)?;
 
-            let int_status = loop {
-                let status = self.irq_status.load(Ordering::Acquire);
-                if status & job.base.int_mask > 0 {
-                    break job.base.int_mask & status;
+            let int_status = if let Some(wait) = wait_fn {
+                loop {
+                    let status = self.irq_status.load(Ordering::Acquire);
+                    if status & job.base.int_mask > 0 {
+                        break job.base.int_mask & status;
+                    }
+                    if status != 0 {
+                        debug!("Unexpected IRQ status: {:#x}", status);
+                        return Err(RknpuError::TaskError);
+                    }
+                    (wait)();
                 }
-                if status != 0 {
-                    debug!("Unexpected IRQ status: {:#x}", status);
-                    return Err(RknpuError::TaskError);
+            } else {
+                loop {
+                    let status = self.pc().interrupt_status().read().bits();
+                    let status = rknpu_fuzz_status(status);
+                    if status & job.base.int_mask > 0 {
+                        break job.base.int_mask & status;
+                    }
+                    if status != 0 {
+                        debug!("Interrupt status changed: {:#x}", status);
+                        return Err(RknpuError::TaskError);
+                    }
                 }
             };
 
@@ -430,7 +490,7 @@ impl RknpuCore {
         let fuzzed = rknpu_fuzz_status(int_status);
 
         if fuzzed != 0 {
-            warn!(
+            debug!(
                 "[NPU] IRQ core{} raw_status={:#x} fuzzed={:#x}",
                 self.core_slot, int_status, fuzzed
             );
@@ -453,22 +513,22 @@ impl RknpuCore {
 #[inline(always)]
 pub fn rknpu_fuzz_status(status: u32) -> u32 {
     let mut fuzz_status = 0;
-    if (status & 0x3) == 0x3 {
+    if (status & 0x3) != 0 {
         fuzz_status |= 0x3;
     }
-    if (status & 0xc) == 0xc {
+    if (status & 0xc) != 0 {
         fuzz_status |= 0xc;
     }
-    if (status & 0x30) == 0x30 {
+    if (status & 0x30) != 0 {
         fuzz_status |= 0x30;
     }
-    if (status & 0xc0) == 0xc0 {
+    if (status & 0xc0) != 0 {
         fuzz_status |= 0xc0;
     }
-    if (status & 0x300) == 0x300 {
+    if (status & 0x300) != 0 {
         fuzz_status |= 0x300;
     }
-    if (status & 0xc00) == 0xc00 {
+    if (status & 0xc00) != 0 {
         fuzz_status |= 0xc00;
     }
     fuzz_status
@@ -477,7 +537,6 @@ pub fn rknpu_fuzz_status(status: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{vec, vec::Vec};
 
     const FAKE_MMIO_LEN: usize = 0x10000;
 

@@ -45,7 +45,7 @@ pub struct SubmitBase {
     /// Execution-mode flags such as `PC`, `BLOCK`, or `PINGPONG`.
     pub flags: JobMode,
     /// DMA address of the `RknpuTask[]` descriptor array on the ioctl path.
-    pub task_array_dma_addr: u32,
+    pub task_array_dma_address: u32,
     /// Target NPU core index.
     pub core_idx: usize,
     /// Interrupt mask to wait for after launch.
@@ -95,7 +95,7 @@ impl Submit {
     pub fn new(tasks: Vec<Operation>) -> Self {
         let base = SubmitBase {
             flags: JobMode::PC | JobMode::BLOCK | JobMode::PINGPONG,
-            task_array_dma_addr: 0,
+            task_array_dma_address: 0,
             core_idx: 0,
             int_mask: 0x300, // wait for DPU completion
             int_clear: 0x1ffff,

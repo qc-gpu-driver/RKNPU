@@ -16,8 +16,8 @@ use crate::{
 };
 
 use super::{
-    RknpuRuntime, RknpuService, RknpuServiceError, RknpuSubmitWaiter, RknpuWorkerListener,
-    RknpuWorkerSignal, handle::SubmitHandle,
+    RknpuPlatform, RknpuService, RknpuServiceError, RknpuSubmitWaiter, RknpuWorkerListener,
+    RknpuWorkerSignal,
 };
 
 /// Monotonic task-id generator for queued blocking submits.
@@ -53,18 +53,14 @@ struct CoreRunBinding {
 struct DispatchSetup {
     /// Target physical core for this driver call.
     core_slot: usize,
-    /// Live submit id that owns the dispatch.
-    task_id: RknpuQueueTaskId,
-    /// Logical lane inside that submit.
-    lane_slot: u8,
-    /// Absolute task index inside `RknpuQueueTask.tasks`.
-    task_index: u32,
+    /// Scheduler-owned submit/lane/task binding recorded for this core.
+    binding: CoreRunBinding,
     /// Job-mode flags copied from the submit header.
     submit_flags: u32,
     /// Total number of task descriptors in this submit.
     task_total: u32,
     /// DMA base of the task descriptor array.
-    task_dma_base: u64,
+    task_array_dma_address: u64,
     /// Snapshot of the task descriptor used to program hardware.
     task: RknpuTask,
 }
@@ -196,6 +192,12 @@ impl<W: RknpuSubmitWaiter> NpuSchedulerState<W> {
         None
     }
 
+    /// Reserve a dispatch from an already-running submit.
+    fn prepare_dispatch_from_running(&mut self, core_slot: usize) -> Option<DispatchSetup> {
+        let binding = self.find_running_candidate_for_core(core_slot)?;
+        self.prepare_dispatch(core_slot, binding)
+    }
+
     /// Promote one ready submit to running and reserve its first dispatch.
     fn promote_ready_and_prepare_dispatch(&mut self, core_slot: usize) -> Option<DispatchSetup> {
         let task_id = self.pop_ready_candidate_for_core(core_slot)?;
@@ -234,12 +236,10 @@ impl<W: RknpuSubmitWaiter> NpuSchedulerState<W> {
         self.core_binding.insert(core_slot, binding);
         Some(DispatchSetup {
             core_slot,
-            task_id: binding.task_id,
-            lane_slot: binding.lane_slot,
-            task_index: binding.task_index,
+            binding,
             submit_flags: meta.flags,
             task_total: task.tasks.len() as u32,
-            task_dma_base: meta.task_dma_base,
+            task_array_dma_address: meta.task_array_dma_address,
             task: task_snapshot,
         })
     }
@@ -308,12 +308,12 @@ impl<W: RknpuSubmitWaiter> NpuSchedulerState<W> {
     }
 }
 
-pub(super) struct RknpuScheduler<P: RknpuRuntime> {
+pub(super) struct RknpuScheduler<P: RknpuPlatform> {
     state: Mutex<NpuSchedulerState<P::Waiter>>,
     kick: P::WorkerSignal,
 }
 
-impl<P: RknpuRuntime> RknpuScheduler<P> {
+impl<P: RknpuPlatform> RknpuScheduler<P> {
     /// Build the scheduler state and worker wake-up primitive for one service.
     pub(super) fn new(platform: &P) -> Self {
         Self {
@@ -323,7 +323,7 @@ impl<P: RknpuRuntime> RknpuScheduler<P> {
     }
 }
 
-impl<P: RknpuRuntime> RknpuService<P> {
+impl<P: RknpuPlatform> RknpuService<P> {
     /// Enqueue one submit, install its waiter, and wake the worker if needed.
     pub fn enqueue_submit(
         &self,
@@ -351,7 +351,7 @@ impl<P: RknpuRuntime> RknpuService<P> {
             submit_snapshot.priority,
             submit_snapshot.task_total,
             submit_snapshot.core_mask,
-            submit_snapshot.task_dma_base,
+            submit_snapshot.task_array_dma_address,
             spawn_worker,
             submit_snapshot.lane_ranges[0].task_start,
             submit_snapshot.lane_ranges[0].task_number,
@@ -371,15 +371,6 @@ impl<P: RknpuRuntime> RknpuService<P> {
 
         self.inner.scheduler.kick.notify_one();
         Ok(task_id)
-    }
-
-    /// Enqueue one submit and return a handle without blocking.
-    pub fn submit_async(
-        &self,
-        queued_submit: RknpuQueuedSubmit,
-    ) -> Result<SubmitHandle<P>, RknpuServiceError> {
-        let task_id = self.enqueue_submit(queued_submit)?;
-        Ok(SubmitHandle::new(self.clone(), task_id))
     }
 
     /// Block the caller until the specified submit becomes terminal.
@@ -504,18 +495,18 @@ impl<P: RknpuRuntime> RknpuService<P> {
     }
 
     /// Convert one failed dispatch into task state and wake it if terminal.
-    fn fail_dispatch(&self, core_slot: usize, task_id: RknpuQueueTaskId, lane_slot: u8, task_index: u32, err: RknpuError) {
+    fn fail_dispatch(&self, core_slot: usize, binding: CoreRunBinding, err: RknpuError) {
         let terminal_ids = {
             let mut state = self.inner.scheduler.state.lock();
             state.core_binding.remove(&core_slot);
 
             let mut terminal_ids = Vec::new();
-            if let Some(task) = state.tasks.get_mut(&task_id) {
-                task.fail_lane(lane_slot as usize, err);
+            if let Some(task) = state.tasks.get_mut(&binding.task_id) {
+                task.fail_lane(binding.lane_slot as usize, err);
             }
 
-            if let Some(id) = state.reclassify_task(task_id) {
-                terminal_ids.push(id);
+            if let Some(task_id) = state.reclassify_task(binding.task_id) {
+                terminal_ids.push(task_id);
             }
 
             terminal_ids
@@ -643,7 +634,7 @@ impl<P: RknpuRuntime> RknpuService<P> {
                     );
                 }
 
-                warn!(
+                debug!(
                     "[rknpu-scheduler] harvested completion core={} queue_task={} task_index={} \
                      lane={} observed={:#x} last_task_int_status={:#x} task_error={}",
                     core_slot,
@@ -683,16 +674,13 @@ impl<P: RknpuRuntime> RknpuService<P> {
                     let mut prepared = None;
 
                     for core_slot in idle_cores {
-                        if let Some(binding) = state.find_running_candidate_for_core(core_slot) {
-                            if let Some(setup) = state.prepare_dispatch(core_slot, binding) {
-                                prepared = Some(setup);
-                                break;
-                            }
+                        if let Some(setup) = state.prepare_dispatch_from_running(core_slot) {
+                            prepared = Some(setup);
+                            break;
                         }
 
                         if !running_has_candidate {
-                            if let Some(setup) =
-                                state.promote_ready_and_prepare_dispatch(core_slot)
+                            if let Some(setup) = state.promote_ready_and_prepare_dispatch(core_slot)
                             {
                                 prepared = Some(setup);
                                 break;
@@ -708,17 +696,17 @@ impl<P: RknpuRuntime> RknpuService<P> {
                 break;
             };
 
-            if confirmed_submit_ids.insert(setup.task_id) {
+            if confirmed_submit_ids.insert(setup.binding.task_id) {
                 debug!(
                     "[rknpu-scheduler] confirm_write_all queue_task={}",
-                    setup.task_id
+                    setup.binding.task_id
                 );
                 if let Err(err) = self.with_npu_driver(|rknpu_dev| rknpu_dev.comfirm_write_all()) {
                     warn!(
                         "[rknpu-scheduler] confirm_write_all failed for queue_task={}: {:?}",
-                        setup.task_id, err
+                        setup.binding.task_id, err
                     );
-                    self.fail_dispatch(setup.core_slot, setup.task_id, setup.lane_slot, setup.task_index, err.to_driver_error());
+                    self.fail_dispatch(setup.core_slot, setup.binding, err.to_driver_error());
                     continue;
                 }
             }
@@ -728,9 +716,9 @@ impl<P: RknpuRuntime> RknpuService<P> {
                     setup.core_slot,
                     setup.submit_flags,
                     setup.task_total,
-                    setup.task_dma_base,
-                    setup.lane_slot,
-                    setup.task_index,
+                    setup.task_array_dma_address,
+                    setup.binding.lane_slot,
+                    setup.binding.task_index,
                     &mut setup.task,
                 )
             });
@@ -739,19 +727,19 @@ impl<P: RknpuRuntime> RknpuService<P> {
                 Ok(()) => {
                     debug!(
                         "[rknpu-scheduler] dispatched queue_task={} core={} lane={} task_index={}",
-                        setup.task_id,
+                        setup.binding.task_id,
                         setup.core_slot,
-                        setup.lane_slot,
-                        setup.task_index
+                        setup.binding.lane_slot,
+                        setup.binding.task_index
                     );
                     dispatched = true;
                 }
                 Err(err) => {
                     warn!(
                         "[rknpu-scheduler] dispatch failed for queue_task={} core={} task={}: {:?}",
-                        setup.task_id, setup.core_slot, setup.task_index, err
+                        setup.binding.task_id, setup.core_slot, setup.binding.task_index, err
                     );
-                    self.fail_dispatch(setup.core_slot, setup.task_id, setup.lane_slot, setup.task_index, err.to_driver_error());
+                    self.fail_dispatch(setup.core_slot, setup.binding, err.to_driver_error());
                 }
             }
         }
@@ -760,7 +748,7 @@ impl<P: RknpuRuntime> RknpuService<P> {
     }
 
     /// Drop a waiter after an interrupted blocking wait and prevent later copy-back.
-    pub(super) fn abort_wait(&self, task_id: RknpuQueueTaskId) {
+    fn abort_wait(&self, task_id: RknpuQueueTaskId) {
         let mut state = self.inner.scheduler.state.lock();
         state.waiters.remove(&task_id);
 
@@ -775,17 +763,6 @@ impl<P: RknpuRuntime> RknpuService<P> {
         if state.reclassify_task(task_id).is_some() {
             state.complete.remove(&task_id);
         }
-    }
-
-    /// Detach one waiter without changing submit execution state.
-    ///
-    /// This is used by `SubmitHandle::drop` for fire-and-forget async submits:
-    /// the submit must continue running, but no completion needs to be kept for
-    /// later `wait()/poll()` consumption.
-    pub(super) fn detach_waiter(&self, task_id: RknpuQueueTaskId) {
-        let mut state = self.inner.scheduler.state.lock();
-        state.waiters.remove(&task_id);
-        state.complete.remove(&task_id);
     }
 
     /// Singleton worker loop that alternates harvest, dispatch, and idle sleep.
@@ -873,15 +850,5 @@ impl<P: RknpuRuntime> RknpuService<P> {
     /// Test-only probe for whether the mock worker has issued hardware work.
     pub(super) fn has_inflight_dispatches(&self) -> bool {
         !self.inner.scheduler.state.lock().core_binding.is_empty()
-    }
-
-    #[cfg(test)]
-    pub(super) fn core_binding_count(&self) -> usize {
-        self.inner.scheduler.state.lock().core_binding.len()
-    }
-
-    #[cfg(test)]
-    pub(super) fn is_submit_terminal(&self, id: RknpuQueueTaskId) -> bool {
-        self.inner.scheduler.state.lock().complete.contains_key(&id)
     }
 }

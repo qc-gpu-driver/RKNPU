@@ -12,16 +12,14 @@
 use alloc::sync::Arc;
 
 mod error;
-mod handle;
 mod ioctl;
 mod platform;
 mod scheduler;
 
 pub use error::RknpuServiceError;
-pub use handle::SubmitHandle;
 pub use ioctl::{RknpuCmd, RknpuUserAction};
 pub use platform::{
-    RknpuDeviceAccess, RknpuRuntime, RknpuSchedulerRuntime, RknpuSubmitWaiter, RknpuUserMemory,
+    RknpuDeviceAccess, RknpuPlatform, RknpuSchedulerRuntime, RknpuSubmitWaiter, RknpuUserMemory,
     RknpuWorkerListener, RknpuWorkerSignal,
 };
 pub use scheduler::CompletedSubmit;
@@ -33,16 +31,16 @@ use scheduler::RknpuScheduler;
 /// The service is intentionally not a crate-global singleton. Each embedding
 /// OS or test harness can construct and own an instance with its own platform
 /// adapter.
-pub struct RknpuService<P: RknpuRuntime> {
+pub struct RknpuService<P: RknpuPlatform> {
     inner: Arc<RknpuServiceInner<P>>,
 }
 
-struct RknpuServiceInner<P: RknpuRuntime> {
+struct RknpuServiceInner<P: RknpuPlatform> {
     platform: P,
     scheduler: RknpuScheduler<P>,
 }
 
-impl<P: RknpuRuntime> Clone for RknpuService<P> {
+impl<P: RknpuPlatform> Clone for RknpuService<P> {
     /// Clone the shared service handle by cloning the inner `Arc`.
     fn clone(&self) -> Self {
         Self {
@@ -51,7 +49,7 @@ impl<P: RknpuRuntime> Clone for RknpuService<P> {
     }
 }
 
-impl<P: RknpuRuntime> RknpuService<P> {
+impl<P: RknpuPlatform> RknpuService<P> {
     /// Build a new service around one platform adapter.
     pub fn new(platform: P) -> Self {
         let scheduler = RknpuScheduler::new(&platform);

@@ -450,4 +450,3 @@ cargo test --test test -- tests --show-output --uboot
 - `MemSync` 当前是 no-op，因为现有 DMA 分配路径使用一致性内存。
 - service 对外仍是 blocking submit，内部由 worker 异步推进；如果要做真正异步 userspace API，还需要新增上层语义。
 - 真实硬件稳定性和长时间运行场景还需要继续补测试。
-# RKNPU

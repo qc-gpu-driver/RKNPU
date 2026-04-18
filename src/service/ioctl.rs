@@ -6,7 +6,7 @@ use crate::{
     ioctrl::{RknpuMemCreate, RknpuMemDestroy, RknpuMemMap, RknpuMemSync, RknpuSubmit},
 };
 
-use super::{RknpuRuntime, RknpuService, RknpuServiceError};
+use super::{RknpuPlatform, RknpuService, RknpuServiceError};
 
 /// RKNPU driver-ioctl command numbers.
 #[repr(u32)]
@@ -32,12 +32,12 @@ impl TryFrom<u32> for RknpuCmd {
     /// Decode the historical ioctl number into the internal command enum.
     fn try_from(nr: u32) -> Result<Self, Self::Error> {
         match nr {
-            0x00 => Ok(Self::Action),
-            0x01 => Ok(Self::Submit),
-            0x02 => Ok(Self::MemCreate),
-            0x03 => Ok(Self::MemMap),
-            0x04 => Ok(Self::MemDestroy),
-            0x05 => Ok(Self::MemSync),
+            0x00 | 0x40 => Ok(Self::Action),
+            0x01 | 0x41 => Ok(Self::Submit),
+            0x02 | 0x42 => Ok(Self::MemCreate),
+            0x03 | 0x43 => Ok(Self::MemMap),
+            0x04 | 0x44 => Ok(Self::MemDestroy),
+            0x05 | 0x45 => Ok(Self::MemSync),
             _ => Err(()),
         }
     }
@@ -63,7 +63,7 @@ impl Default for RknpuUserAction {
     }
 }
 
-impl<P: RknpuRuntime> RknpuService<P> {
+impl<P: RknpuPlatform> RknpuService<P> {
     /// Main service entry point used by OS device adapters.
     pub fn driver_ioctl(&self, op: RknpuCmd, arg: usize) -> Result<usize, RknpuServiceError> {
         match op {
@@ -100,55 +100,66 @@ impl<P: RknpuRuntime> RknpuService<P> {
     fn handle_submit_ioctl(&self, arg: usize) -> Result<usize, RknpuServiceError> {
         let submit_args = self.copy_from_user::<RknpuSubmit>(arg)?;
 
-        if submit_args.task_number == 0 || submit_args.task_array_cpu_addr == 0 {
-            warn!(
-                "rknpu invalid submit header: task_number={}, task_array_cpu_addr={:#x}, \
-                 task_array_dma_addr={:#x}",
-                submit_args.task_number, submit_args.task_array_cpu_addr, submit_args.task_array_dma_addr,
+        if submit_args.task_number == 0 || submit_args.task_array_cpu_address == 0 {
+            debug!(
+                "rknpu invalid submit header: task_number={}, task_array_cpu_address={:#x}, \
+                 task_array_dma_address={:#x}",
+                submit_args.task_number, submit_args.task_array_cpu_address, submit_args.task_array_dma_address,
             );
             return Err(RknpuServiceError::InvalidData);
         }
 
-        if submit_args.task_array_dma_addr == 0 {
-            return Err(RknpuServiceError::InvalidData);
+        if submit_args.task_array_dma_address == 0 {
+            debug!(
+                "rknpu submit header keeps legacy zero task_array_dma_address, scheduler will preserve \
+                 zero DMA base"
+            );
         }
 
-        let user_task_array_cpu_addr = submit_args.task_array_cpu_addr;
+        let user_task_array_cpu_address = submit_args.task_array_cpu_address;
         let task_bytes = (submit_args.task_number as usize)
             .checked_mul(mem::size_of::<RknpuTask>())
             .ok_or(RknpuServiceError::InvalidData)?;
         let mut tasks = vec![RknpuTask::default(); submit_args.task_number as usize];
         self.inner.platform.copy_from_user(
             tasks.as_mut_ptr() as *mut u8,
-            user_task_array_cpu_addr as *const u8,
+            user_task_array_cpu_address as *const u8,
             task_bytes,
         )?;
 
-        warn!(
+        debug!(
             "[rknpu-submit] queueing blocking submit task_number={} core_mask={:#x} \
-             timeout={} task_array_dma_addr={:#x} user_task_array_cpu_addr={:#x}",
+             timeout={} task_array_dma_address={:#x} user_task_array_cpu_address={:#x}",
             submit_args.task_number,
             submit_args.core_mask,
             submit_args.timeout,
-            submit_args.task_array_dma_addr,
-            user_task_array_cpu_addr
+            submit_args.task_array_dma_address,
+            user_task_array_cpu_address
         );
-        let handle = self.submit_async(RknpuQueuedSubmit::new(submit_args.clone(), tasks))?;
-        warn!(
-            "[rknpu-submit] enqueued queue_task={:?} and entering blocking wait",
-            handle.task_id()
-        );
-        let finished = handle.wait()?;
-        let mut finished_submit = finished.submit;
-        finished_submit.task_array_cpu_addr = user_task_array_cpu_addr;
+        let queue_task_id =
+            self.enqueue_submit(RknpuQueuedSubmit::new(submit_args.clone(), tasks))?;
 
-        warn!(
-            "[rknpu-submit] terminal task_counter={} last_error={:?}",
-            finished_submit.task_counter, finished.last_error
+        debug!(
+            "[rknpu-submit] enqueued queue_task={} and entering blocking wait",
+            queue_task_id
+        );
+        self.wait_for_submit(queue_task_id)?;
+
+        debug!(
+            "[rknpu-submit] blocking wait finished for queue_task={}, collecting terminal snapshot",
+            queue_task_id
+        );
+        let finished = self.take_terminal_submit(queue_task_id)?;
+        let mut finished_submit = finished.submit;
+        finished_submit.task_array_cpu_address = user_task_array_cpu_address;
+
+        debug!(
+            "[rknpu-submit] terminal queue_task={} task_counter={} last_error={:?}",
+            queue_task_id, finished_submit.task_counter, finished.last_error
         );
 
         self.inner.platform.copy_to_user(
-            user_task_array_cpu_addr as *mut u8,
+            user_task_array_cpu_address as *mut u8,
             finished.tasks.as_ptr() as *const u8,
             task_bytes,
         )?;
