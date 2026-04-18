@@ -1,0 +1,3 @@
+[target.'cfg(all(target_os = "none"))']
+# runner = "ostool cargo-test"
+runner = "cargo osrun"
